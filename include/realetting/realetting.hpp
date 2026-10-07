@@ -6,25 +6,28 @@
  *
  *   s["model"] = "m-large";                      // 即刻落盘，只动 /model 这一处
  *   s["mcp"]["fs"]["cmd"] = "node";              // 中间的对象自动建
+ *   s["tags"]->push_back("x");                   // -> 后面是 nlohmann::json 的全部方法
+ *   s->erase("model");                           // 从文件里删掉，回落到默认值
  *   std::string m = s["model"].get<std::string>();
  *   s["model"].path();                           // ".../settings.json#/model"
- *   s["model"].erase();                          // 从文件里删掉，回落到默认值
- *   s.edit([](realetting::json &j) { j["tags"].push_back("x"); });
  *
  * 约定：
  * - 内存 = 默认值 ⊕ 文件（merge_patch：对象逐层合并，其余整个覆盖）。默认值只在内存里，
  *   文件里只出现写过的位置。默认值用 cfg.open(name, defaults) 给。
- * - 每次写都先重读文件再改这一处：别人手改过的地方不会被盖掉，内存也跟着文件走。
- * - 赋值写的是整个位置；edit 只把前后有差别的对象键写进去，数组和标量整个写。
+ * - 每次修改：锁住 → 重读文件 → 在副本上改 → 比较前后 → 只把差别写进文件。
+ *   对象逐键比较，数组和标量整个写；没差别就不碰文件。别人手改过的地方不会被盖掉。
+ * - 一句就是一次原子修改：-> 造出的临时对象持锁到这一句结束。这一句里抛了异常，修改作废。
  * - 文件读不懂、位置走不通（比如往字符串里放键）时抛 realetting::error，文件和内存都不变。
  * - 写入是 临时文件 + fsync + rename + fsync 目录：进程被杀、断电都不会留下半截文件。
  *   新建的文件权限 0600（配置里常有密钥），已有文件保持原权限。
  * - 同一个 Dir 打开同一个文件拿到的是同一份状态；读写都可以并发。跨进程不加锁。
+ * - 别把 -> 的结果存起来（auto g = s.operator->()）：它会一直拿着锁。
  * - 只支持 POSIX。
  */
 #pragma once
 
 #include <cerrno>
+#include <exception>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -169,7 +172,15 @@ class File {
         return at(value_, ptr);
     }
 
-    /* 重读文件 → change(文件树, 当前值) → 落盘 → 内存换成 默认值 ⊕ 新文件。
+    /* 重读文件，返回这个位置的最新值 */
+    json fresh(const json::json_pointer &ptr)
+    {
+        std::lock_guard lk(mutex_);
+        value_ = merged(read_tree(path_));
+        return at(value_, ptr);
+    }
+
+    /* 重读文件 → change(文件树) → 落盘 → 内存换成 默认值 ⊕ 新文件。
      * 任何一步失败都抛 error，文件和内存不变。 */
     template <class F>
     void commit(F &&change)
@@ -179,8 +190,9 @@ class File {
         const json orig = tree;
         try
         {
-            change(tree, merged(tree));
-        } catch (const json::exception &e)
+            change(tree);
+        }
+        catch (const json::exception &e)
         {
             fail(path_, e.what());
         }
@@ -189,6 +201,7 @@ class File {
         value_ = std::move(fresh);
     }
 
+    std::recursive_mutex &mutex() { return mutex_; }
     const fs::path &path() const { return path_; }
 
   private:
@@ -202,12 +215,42 @@ class File {
     const fs::path path_;
     const json defaults_;
     json value_;
-    mutable std::mutex mutex_;
+    // 可重入：一句话里可以读写同一个文件好几处
+    mutable std::recursive_mutex mutex_;
+};
+
+/* 一次修改：锁住文件，拿这个位置的最新副本给人改，析构时把差别写回。
+ * 由 Ref::operator-> 造出来的临时对象，活到这一整句结束，所以一句就是一次原子修改。 */
+class Edit {
+  public:
+    Edit(std::shared_ptr<File> file, json::json_pointer ptr)
+        : file_(std::move(file)), ptr_(std::move(ptr)), lock_(file_->mutex()),
+          before_(file_->fresh(ptr_)), after_(before_) {}
+    Edit(const Edit &) = delete;
+    Edit &operator=(const Edit &) = delete;
+
+    ~Edit() noexcept(false)
+    {
+        // 这一句里别处抛了异常：放弃这次修改，也不能再抛
+        if (std::uncaught_exceptions() > uncaught_ || after_ == before_) return;
+        file_->commit([&](json &tree) { apply_diff(tree, ptr_, before_, after_); });
+    }
+
+    json *operator->() { return &after_; }
+    json &operator*() { return after_; }
+
+  private:
+    std::shared_ptr<File> file_;
+    json::json_pointer ptr_;
+    std::unique_lock<std::recursive_mutex> lock_;
+    int uncaught_ = std::uncaught_exceptions();
+    json before_, after_;
 };
 
 } // namespace detail
 
-/* 文件里的一个位置。改它就是改文件；读它读的是内存里那份 默认值 ⊕ 文件。 */
+/* 文件里的一个位置。读它读的是内存里那份 默认值 ⊕ 文件；
+ * 改它（赋值，或 -> 调 nlohmann::json 的任何方法）就是改文件，只写改出来的差别。 */
 class Ref {
   public:
     Ref operator[](std::string_view key) const { return Ref(file_, ptr_ / std::string(key)); }
@@ -215,34 +258,20 @@ class Ref {
 
     Ref &operator=(json v)
     {
-        file_->commit([&](json &tree, const json &) { tree[ptr_] = std::move(v); });
+        *detail::Edit(file_, ptr_) = std::move(v);
         return *this;
     }
     // 和 vector<bool>::reference 一样：Ref 之间赋值是赋值，不是换绑
     Ref &operator=(const Ref &other) { return *this = other.get(); }
     Ref(const Ref &) = default;
 
+    /* s["tags"]->push_back("x")、s->erase("model")、s->update({...}) */
+    detail::Edit operator->() const { return detail::Edit(file_, ptr_); }
+
     /* 位置不存在时是 null */
     json get() const { return file_->get(ptr_); }
     template <class T>
     T get() const { return get().get<T>(); }
-
-    void erase()
-    {
-        file_->commit([&](json &tree, const json &) { detail::erase_at(tree, ptr_); });
-    }
-
-    /* fn 改这个位置的一份副本，改完把有差别的地方写回 */
-    template <class F>
-    void edit(F &&fn)
-    {
-        file_->commit([&](json &tree, const json &current) {
-            const json before = detail::at(current, ptr_);
-            json after = before;
-            fn(after);
-            detail::apply_diff(tree, ptr_, before, after);
-        });
-    }
 
     std::string path() const { return file_->path().string() + "#" + ptr_.to_string(); }
 

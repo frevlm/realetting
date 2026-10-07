@@ -144,35 +144,44 @@ int main()
         CHECK(on_disk() == json({{"model", "m"}}), "文件没动");
     }
 
-    printf("== erase ==\n");
+    printf("== -> 改动走 diff ==\n");
     {
         reset();
         realetting::Dir cfg(dir);
         auto s = cfg.open("settings.json", defaults);
-        s["permission"] = "deny";
-        s["model"] = "m";
-        s["permission"].erase();
-        CHECK(on_disk() == json({{"model", "m"}}), "从文件里删掉");
-        CHECK(s["permission"].get<std::string>() == "ask", "回落到默认值");
-        s["nope"].erase();
-        CHECK(on_disk() == json({{"model", "m"}}), "删不存在的位置什么都不发生");
-    }
-
-    printf("== edit ==\n");
-    {
-        reset();
-        realetting::Dir cfg(dir);
-        auto s = cfg.open("settings.json", defaults);
-        s.edit([](json &j) { j["retries"] = 5; });
-        CHECK(on_disk() == json({{"retries", 5}}), "在根上 edit 也只写改了的键");
-        s["tags"].edit([](json &j) { j.push_back("x"); });
-        CHECK(on_disk()["tags"] == json({"x"}), "数组整个写");
-        s.edit([](json &j) { j.erase("retries"); });
-        CHECK(!on_disk().contains("retries") && s["retries"].get<int>() == 3, "edit 里删掉的键从文件删掉、回落到默认值");
+        s["tags"]->push_back("x");
+        CHECK(on_disk() == json({{"tags", {"x"}}}), "数组上 push_back，整个数组写进去");
+        s->update({{"retries", 5}, {"permission", "ask"}});
+        CHECK(on_disk() == json({{"tags", {"x"}}, {"retries", 5}}), "根上 update：和默认值一样的那个键没写");
+        s["mcp"] = {{"fs", {{"cmd", "cat"}}}, {"web", {{"cmd", "node"}}}};
+        CHECK(on_disk()["mcp"] == json({{"web", {{"cmd", "node"}}}}), "赋值也走 diff：只写和默认值不同的");
+        s->erase("retries");
+        CHECK(!on_disk().contains("retries") && s["retries"].get<int>() == 3, "erase 从文件删掉、回落到默认值");
+        s->erase("nope");
+        s["mcp"]["web"]->erase("cmd");
+        CHECK(on_disk()["mcp"]["web"] == json::object(), "嵌套位置上也能 erase");
+        CHECK(s["tags"]->size() == 1, "-> 也能读");
         put(on_disk().dump()); // 换成紧凑格式：要是又写了一遍，会变回缩进的
         const std::string compact = raw();
-        s.edit([](json &) {});
-        CHECK(raw() == compact, "什么都不改就什么都不写");
+        s["tags"]->size();
+        s["model"] = s["model"];
+        CHECK(raw() == compact, "什么都没改就不碰文件");
+    }
+    {
+        reset();
+        realetting::Dir cfg(dir);
+        auto s = cfg["settings.json"];
+        const auto boom = []() -> std::string { throw std::runtime_error("boom"); };
+        try
+        {
+            s["tags"]->push_back(boom());
+        }
+        catch (const std::runtime_error &)
+        {
+        }
+        CHECK(on_disk() == json::object(), "这一句里抛了异常，修改作废");
+        s["a"]->push_back(s["b"].get());
+        CHECK(on_disk() == json({{"a", {nullptr}}}), "一句里读写同一个文件好几处不死锁");
     }
 
     printf("== 文件 ==\n");
@@ -210,11 +219,10 @@ int main()
             ts.emplace_back([&cfg, t] {
                 // 两种写法指向同一个文件，拿到的是同一份状态
                 auto s = cfg[t % 2 ? "settings.json" : "./settings.json"];
-                for (int i = 0; i < kEach; ++i)
-                    s.edit([](json &j) { j["n"] = j.value("n", 0) + 1; });
+                for (int i = 0; i < kEach; ++i) s["tags"]->push_back(t);
             });
         for (auto &t : ts) t.join();
-        CHECK(on_disk()["n"] == kThreads * kEach, "一次都没丢");
+        CHECK(on_disk()["tags"].size() == kThreads * kEach, "一次都没丢");
     }
 
     reset();
