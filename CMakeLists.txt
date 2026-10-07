@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(realetting VERSION 0.2.0 LANGUAGES CXX)
+project(realetting VERSION 0.1.0 LANGUAGES CXX)
 
 add_library(realetting INTERFACE)
 add_library(realetting::realetting ALIAS realetting)
